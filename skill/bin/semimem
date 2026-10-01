@@ -576,13 +576,13 @@ def session_start_context(config, session):
     except Exception as error:  # noqa: BLE001 - an importer must never break session start
         print(f"semimem: sync failed: {error}", file=sys.stderr)
     records, counts = summary(config)
-    targets = "; ".join(f"{name}: {t.get('description', '')}" for name, t in config.targets.items())
+    targets = ", ".join(config.targets)
     lines = [
         f"Semi-automatic memory is active in this repository ({CONFIG_NAME}). Do not write memory directly:",
         f"propose candidates with `{me} propose`, and the user approves them. Load the semi-auto-memory skill",
         "before proposing or reviewing.",
         f"Mode: {config.mode}. Session id: {session or 'unknown'} (pass --session to propose).",
-        f"Targets: {targets}.",
+        f"Targets: {targets} (`{me} targets` describes them).",
     ]
     if records:
         pending = counts.get("pending", 0)
