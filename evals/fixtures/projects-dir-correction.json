@@ -1,0 +1,10 @@
+{
+  "description": "A correction to existing memory; a fact already documented in the repo",
+  "transcript": "SESSION START CONTEXT: Existing memory note 'Project checkouts': repositories live under ~/Projects.\nUSER: clone org-agenda-api next to my other projects\nAGENT: [ls ~/Projects] ~/Projects is a symlink to ~/projects; the canonical directory is lowercase ~/projects and other tools write the lowercase path.\nAGENT: [git clone into ~/projects/org-agenda-api] Done.\nAGENT: [reads README] The README says to run `just test` for tests; ran it, all pass.\nUSER: thanks",
+  "expect": [
+    {"name": "correct projects dir to lowercase", "any": ["~/projects", "lowercase"]}
+  ],
+  "avoid": [
+    {"name": "README already documents just test", "any": ["just test"]}
+  ]
+}

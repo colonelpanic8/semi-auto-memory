@@ -1,0 +1,11 @@
+{
+  "description": "A standing preference versus a one-time instruction",
+  "transcript": "USER: open a PR for this branch\nAGENT: [runs gh pr create --draft] Opened draft PR #412.\nUSER: no, I always want PRs ready for review, never drafts. and don't put [codex] or any tool prefix in titles.\nAGENT: [gh pr ready 412; edits title] Fixed.\nUSER: also skip the tests this time, I'm in a hurry.\nAGENT: Skipped the local test run; CI will cover it.",
+  "expect": [
+    {"name": "PRs ready for review, not drafts", "any": ["draft", "ready for review"]},
+    {"name": "no tool prefix in PR titles", "any": ["prefix"]}
+  ],
+  "avoid": [
+    {"name": "one-time skip tests", "any": ["skip"]}
+  ]
+}

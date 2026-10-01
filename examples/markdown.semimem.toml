@@ -1,0 +1,9 @@
+# Minimal setup for any repository: approved memories become bullets in MEMORY.md.
+queue = ".semimem/queue.jsonl"
+mode = "interactive"
+
+[targets.notes]
+description = "Durable notes for future agent sessions: workflows, quirks, conventions"
+builtin = "markdown"
+path = "MEMORY.md"
+heading = "## Memory"

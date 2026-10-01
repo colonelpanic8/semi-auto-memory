@@ -1,0 +1,28 @@
+{
+  "description": "Deploy debugging with one durable lesson, a one-off formatting request, and progress narration",
+  "transcript": "USER: the new /memory endpoint returns 403 in prod but works locally, can you figure out why?\nAGENT: [runs curl against prod: 403 from nginx, not from the app]\nAGENT: [reads deploy/nginx.conf] The container's nginx has an explicit location allowlist; /memory isn't in it. Every new endpoint has to be added there or nginx rejects it before it reaches the app.\nAGENT: [adds location /memory, rebuilds, redeploys with `just deploy-prod`] 200 now.\nUSER: great. don't bother with a changelog entry this time, it's a hotfix.\nAGENT: Skipped the changelog. I also bumped the image tag to 2026-10-01.\nUSER: thanks",
+  "expect": [
+    {
+      "name": "nginx allowlist needs each new endpoint",
+      "any": [
+        "allowlist",
+        "location"
+      ]
+    }
+  ],
+  "avoid": [
+    {
+      "name": "one-off changelog skip",
+      "any": [
+        "changelog"
+      ]
+    },
+    {
+      "name": "image tag progress",
+      "any": [
+        "image tag",
+        "2026-10-01"
+      ]
+    }
+  ]
+}

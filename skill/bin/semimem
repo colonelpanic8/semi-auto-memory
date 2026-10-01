@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+"""semimem: semi-automatic memory for coding agents.
+
+Agents propose memory candidates, a person approves or rejects them, and a
+configured writer stores the approved ones. The queue is an append-only JSONL
+event log; every record is self-contained so any agent or script can write it.
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import tomllib
+
+CONFIG_NAME = ".semimem.toml"
+KINDS = ("fact", "preference", "procedure", "correction", "review", "other")
+OPEN = ("pending", "approved", "failed", "stale")
+FIELDS = ("title", "text", "kind", "target", "ref", "evidence")
+PLACEHOLDER = re.compile(r"\{(id|title|ref|kind|agent|target|session)\}")
+TOOL_CALL_MARKERS = (
+    '"type":"tool_use"',
+    '"type": "tool_use"',
+    '"type":"function_call"',
+    '"type": "function_call"',
+    '"type":"custom_tool_call"',
+    '"type": "custom_tool_call"',
+)
+
+SAMPLE_CONFIG = """\
+# semi-automatic memory: https://github.com/colonelpanic8/semi-auto-memory
+queue = ".semimem/queue.jsonl"
+mode = "interactive"            # or "unattended"; SEMIMEM_MODE overrides
+default_target = "notes"
+
+[stop_hook]
+min_tool_calls = 15             # work needed before the Stop hook asks for candidates
+
+[targets.notes]
+description = "Durable project notes for future agent sessions"
+builtin = "markdown"
+path = "MEMORY.md"
+"""
+
+
+class Error(Exception):
+    pass
+
+
+def now():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def new_id():
+    return f"m-{datetime.now(timezone.utc).astimezone():%Y%m%d}-{secrets.token_hex(3)}"
+
+
+def digest(text):
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+# Configuration
+
+
+class Config:
+    def __init__(self, path):
+        self.path = path
+        self.root = path.parent
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+        self.queue = Queue(self.root / data.get("queue", ".semimem/queue.jsonl"))
+        self.mode = os.environ.get("SEMIMEM_MODE") or data.get("mode", "interactive")
+        self.targets = data.get("targets", {})
+        self.default_target = data.get("default_target") or next(iter(self.targets), None)
+        self.importers = data.get("importers", [])
+        stop = data.get("stop_hook", {})
+        self.min_tool_calls = int(stop.get("min_tool_calls", 15))
+        self.min_stops = int(stop.get("min_stops", 4))
+        if not self.targets:
+            raise Error(f"{path}: no [targets.*] configured")
+
+    def target(self, name):
+        if name not in self.targets:
+            raise Error(f"unknown target {name!r}; configured: {', '.join(self.targets)}")
+        return self.targets[name]
+
+
+def find_config(start=None):
+    if env := os.environ.get("SEMIMEM_CONFIG"):
+        return Config(Path(env).resolve())
+    here = Path(start or os.getcwd()).resolve()
+    for directory in (here, *here.parents):
+        candidate = directory / CONFIG_NAME
+        if candidate.is_file():
+            return Config(candidate)
+    raise Error(f"no {CONFIG_NAME} found from {here} upward; run `semimem init`")
+
+
+# Queue
+
+
+class Queue:
+    def __init__(self, path):
+        self.path = path
+
+    def append(self, *events):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            for event in events:
+                handle.write(json.dumps({"at": now(), **event}, ensure_ascii=False) + "\n")
+
+    def records(self):
+        records = {}
+        if not self.path.exists():
+            return records
+        for number, line in enumerate(self.path.read_text().splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+                fold(records, event)
+            except (ValueError, KeyError, TypeError) as error:
+                print(f"semimem: skipping malformed queue line {number}: {error}", file=sys.stderr)
+        return records
+
+    def get(self, ident):
+        records = self.records()
+        if ident in records:
+            return records[ident]
+        matches = [r for key, r in records.items() if key.endswith(ident)]
+        if len(matches) == 1:
+            return matches[0]
+        raise Error(f"no unique record matches {ident!r}")
+
+
+def fold(records, event):
+    kind, ident = event["event"], event["id"]
+    if kind == "propose":
+        records[ident] = {**event, "status": "pending", "history": []}
+        del records[ident]["event"]
+        return
+    record = records[ident]
+    record["history"].append({k: v for k, v in event.items() if k != "id"})
+    if kind == "edit":
+        record.update({k: v for k, v in event.items() if k in FIELDS})
+        record["edited"] = True
+        if "target_hash" in event:
+            record["target_hash"] = event["target_hash"]
+    elif kind in ("approve", "applied", "reject", "failed", "stale"):
+        record["status"] = {"approve": "approved", "reject": "rejected"}.get(kind, kind)
+    else:
+        raise KeyError(f"unknown event {kind!r}")
+
+
+# Targets
+
+
+def substitute(template, record):
+    values = {
+        "id": record["id"],
+        "title": record["title"],
+        "ref": record.get("ref") or record["title"],
+        "kind": record.get("kind", ""),
+        "agent": record.get("agent", ""),
+        "target": record.get("target", ""),
+        "session": record.get("session") or "",
+    }
+    return PLACEHOLDER.sub(lambda m: shlex.quote(values[m.group(1)]), template)
+
+
+def run(config, template, record, stdin=None):
+    return subprocess.run(
+        substitute(template, record),
+        shell=True,
+        cwd=config.root,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def markdown_entries(path):
+    """Map entry title -> entry text for a builtin markdown target."""
+    entries, current = {}, None
+    if not path.exists():
+        return entries
+    for line in path.read_text().splitlines():
+        match = re.match(r"^- \*\*(.+?)\*\*(?: — (.*))?$", line)
+        if match:
+            current = match.group(1)
+            entries[current] = match.group(2) or ""
+        elif current and line.startswith("  "):
+            entries[current] += "\n" + line.strip()
+        else:
+            current = None
+    return entries
+
+
+def fingerprint(config, record):
+    target = config.target(record["target"])
+    if target.get("builtin") == "markdown":
+        entry = markdown_entries(config.root / target["path"]).get(record.get("ref") or record["title"], "")
+        return digest(entry)
+    if command := target.get("fingerprint"):
+        result = run(config, command, record)
+        return digest(result.stdout if result.returncode == 0 else "")
+    return None
+
+
+def write_markdown(config, target, record):
+    path = config.root / target["path"]
+    heading = target.get("heading", "## Memory")
+    lines = path.read_text().splitlines() if path.exists() else []
+    title = record.get("ref") or record["title"]
+    body = record["text"].strip().splitlines()
+    stamp = f" ({record.get('agent') or 'agent'}, {record['at'][:10]})"
+    entry = [f"- **{title}** — {body[0]}"] + [f"  {line}" for line in body[1:]]
+    entry[-1] += stamp
+    start = next((i for i, line in enumerate(lines) if line.startswith(f"- **{title}**")), None)
+    if start is not None:
+        end = start + 1
+        while end < len(lines) and lines[end].startswith("  "):
+            end += 1
+        lines[start:end] = entry
+    else:
+        if heading not in lines:
+            lines += ([""] if lines else []) + [heading, ""]
+        index = lines.index(heading) + 1
+        while index < len(lines) and not lines[index].startswith("#"):
+            index += 1
+        while index > 0 and not lines[index - 1].strip():
+            index -= 1
+        lines[index:index] = entry
+    path.write_text("\n".join(lines) + "\n")
+
+
+def apply(config, record):
+    """Write an approved record. Returns (ok, detail); detail None means an agent must write it."""
+    target = config.target(record["target"])
+    if target.get("builtin") == "markdown":
+        write_markdown(config, target, record)
+        return True, f"wrote {target['path']}"
+    if target.get("writer") == "agent":
+        return True, None
+    if command := target.get("write"):
+        result = run(config, command, record, stdin=record["text"])
+        output = (result.stdout + result.stderr).strip()
+        return result.returncode == 0, output or f"exit {result.returncode}"
+    raise Error(f"target {record['target']!r} has no builtin, write command, or agent writer")
+
+
+# Rendering
+
+
+def invocation():
+    """How an agent should call this script."""
+    own = Path(sys.argv[0]).absolute()
+    found = shutil.which("semimem")
+    if found and Path(found).resolve() == own.resolve():
+        return "semimem"
+    return f"python3 {shlex.quote(str(own))}"
+
+
+def one_line(text, width=160):
+    flat = " ".join(text.split())
+    return flat if len(flat) <= width else flat[: width - 1] + "…"
+
+
+def render(records):
+    if not records:
+        return "No memory candidates."
+    lines = ['Memory candidates (reply e.g. "1 y, 2 n, 3 edit: …"):']
+    for number, record in enumerate(records, 1):
+        where = record["target"] + (
+            f" → {record['ref']}" if record.get("ref") and record["ref"] != record["title"] else ""
+        )
+        lines.append(f"{number}. [{where}] **{record['title']}** — {one_line(record['text'])}  `{record['id']}`")
+    return "\n".join(lines)
+
+
+def brief(config, record):
+    target = config.target(record["target"])
+    me = invocation()
+    return "\n".join(
+        [
+            f"You are writing one approved memory into {config.root}.",
+            "",
+            f"Target: {record['target']} — {target.get('description', '')}",
+            f"Reference: {record.get('ref') or '(choose the right place)'}",
+            f"Title: {record['title']}",
+            f"Kind: {record.get('kind', '')}",
+            f"Proposed by: {record.get('agent', '')} on {record['at'][:10]}",
+            f"Evidence: {record.get('evidence') or '(none given)'}",
+            "",
+            "Approved text:",
+            record["text"],
+            "",
+            "How to write to this target:",
+            target.get("instructions", "Follow the repository's conventions for this target."),
+            "",
+            "Search for an existing entry first and update it rather than adding a near-duplicate.",
+            f"When the write is done, run: {me} done {record['id']} --detail '<where it went>'",
+            f"If it cannot be done, run: {me} fail {record['id']} --error '<why>'",
+        ]
+    )
+
+
+# Commands
+
+
+def read_text(value):
+    return sys.stdin.read() if value == "-" else value
+
+
+def cmd_init(args):
+    path = Path.cwd() / CONFIG_NAME
+    if path.exists() and not args.force:
+        raise Error(f"{path} exists; pass --force to overwrite")
+    path.write_text(SAMPLE_CONFIG)
+    print(f"wrote {path}")
+
+
+def cmd_propose(args):
+    config = find_config()
+    text = read_text(args.text).strip()
+    title = args.title.strip()
+    if not title or "\n" in title or not text:
+        raise Error("title must be one nonblank line and text must be nonblank")
+    target = args.target or config.default_target
+    config.target(target)
+    record = {
+        "id": new_id(),
+        "title": title,
+        "text": text,
+        "kind": args.kind,
+        "target": target,
+        "ref": args.ref,
+        "evidence": args.evidence,
+        "agent": args.agent or os.environ.get("SEMIMEM_AGENT") or "agent",
+        "session": args.session,
+        "mode": config.mode,
+    }
+    for existing in config.queue.records().values():
+        same = (existing["target"], existing.get("ref"), existing["title"], existing["text"])
+        if existing["status"] in OPEN and same == (target, args.ref, title, text):
+            print(f"already queued: {existing['id']}")
+            return
+    record["target_hash"] = fingerprint(config, {**record, "at": now()})
+    config.queue.append({"event": "propose", **record})
+    print(f"proposed {record['id']}: [{target}] {title}")
+
+
+def select(config, status, session=None, ids=None):
+    records = list(config.queue.records().values())
+    if ids:
+        wanted = [config.queue.get(i)["id"] for i in ids]
+        return [r for r in records if r["id"] in wanted]
+    if status != "all":
+        records = [r for r in records if r["status"] in status.split(",")]
+    if session:
+        records = [r for r in records if r.get("session") == session]
+    return records
+
+
+def cmd_list(args):
+    config = find_config()
+    records = select(config, args.status, args.session)
+    if args.json:
+        print(json.dumps(records, indent=2, ensure_ascii=False))
+        return
+    for record in records:
+        print(
+            f"{record['id']}  {record['status']:<8} [{record['target']}] {record['title']}  ({record.get('agent', '')}, {record['at'][:10]})"
+        )
+    print(f"{len(records)} records")
+
+
+def cmd_show(args):
+    record = find_config().queue.get(args.id)
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+
+
+def cmd_render(args):
+    config = find_config()
+    print(render(select(config, args.status, args.session, args.ids)))
+
+
+def cmd_approve(args):
+    config = find_config()
+    record = config.queue.get(args.id)
+    if record["status"] not in ("pending", "failed", "stale"):
+        raise Error(f"{record['id']} is {record['status']}; only pending, failed, or stale records can be approved")
+    edits = {k: v for k, v in (("title", args.title), ("target", args.target), ("ref", args.ref)) if v is not None}
+    if args.text is not None:
+        edits["text"] = read_text(args.text).strip()
+    retargeted = "target" in edits or "ref" in edits or ("title" in edits and not record.get("ref"))
+    if edits:
+        config.target(edits.get("target", record["target"]))
+        record = {**record, **edits}
+    if record["status"] == "stale" and not args.force:
+        raise Error(f"{record['id']} is stale: its target changed after it was proposed; re-propose it or pass --force")
+    checkable = not retargeted and not args.force and record.get("target_hash") is not None
+    if checkable and fingerprint(config, record) != record["target_hash"]:
+        config.queue.append({"event": "stale", "id": record["id"]})
+        raise Error(
+            f"{record['id']}: target changed since it was proposed; marked stale. Re-propose against the current target, or approve with --force"
+        )
+    events = []
+    if edits:
+        events.append({"event": "edit", "id": record["id"], **edits})
+    events.append({"event": "approve", "id": record["id"], "by": args.by})
+    ok, detail = apply(config, record)
+    if detail is None:
+        config.queue.append(*events)
+        print(f"approved {record['id']}; it needs an agent writer. Hand this brief to a forked or background agent:\n")
+        print(brief(config, record))
+        return
+    events.append({"event": "applied" if ok else "failed", "id": record["id"], "detail": detail})
+    config.queue.append(*events)
+    if not ok:
+        raise Error(f"{record['id']}: write failed: {detail}")
+    print(f"applied {record['id']}: {detail}")
+
+
+def cmd_reject(args):
+    config = find_config()
+    record = config.queue.get(args.id)
+    if record["status"] not in OPEN:
+        raise Error(f"{record['id']} is already {record['status']}")
+    target = config.target(record["target"])
+    if command := target.get("discard"):
+        result = run(config, command, record)
+        if result.returncode != 0:
+            raise Error(f"{record['id']}: discard failed: {(result.stdout + result.stderr).strip()}")
+    config.queue.append({"event": "reject", "id": record["id"], "reason": args.reason, "by": args.by})
+    print(f"rejected {record['id']}")
+
+
+def cmd_done(args):
+    config = find_config()
+    record = config.queue.get(args.id)
+    if record["status"] != "approved":
+        raise Error(f"{record['id']} is {record['status']}, not approved")
+    config.queue.append({"event": "applied", "id": record["id"], "detail": args.detail})
+    print(f"applied {record['id']}")
+
+
+def cmd_fail(args):
+    config = find_config()
+    record = config.queue.get(args.id)
+    config.queue.append({"event": "failed", "id": record["id"], "detail": args.error})
+    print(f"failed {record['id']}")
+
+
+def cmd_brief(args):
+    config = find_config()
+    print(brief(config, config.queue.get(args.id)))
+
+
+def cmd_targets(args):
+    config = find_config()
+    for name, target in config.targets.items():
+        how = target.get("builtin") or ("agent" if target.get("writer") == "agent" else "command")
+        print(f"{name} ({how}): {target.get('description', '')}")
+
+
+def sync(config):
+    """Run importers; returns the number of new records."""
+    records = [r for r in config.queue.records().values() if r.get("import_key")]
+    open_keys = {r["import_key"] for r in records if r["status"] in OPEN}
+    seen = {(r["import_key"], r["import_hash"]) for r in records}
+    added = 0
+    for importer in config.importers:
+        result = subprocess.run(
+            importer["command"], shell=True, cwd=config.root, capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            print(f"semimem: importer {importer.get('name')} failed: {result.stderr.strip()}", file=sys.stderr)
+            continue
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            key = f"{importer.get('name', 'import')}:{item['key']}"
+            item_hash = digest(item["text"])
+            if key in open_keys or (key, item_hash) in seen:
+                continue
+            target = item.get("target") or importer.get("target") or config.default_target
+            record = {
+                "id": new_id(),
+                "title": item["title"],
+                "text": item["text"],
+                "kind": item.get("kind", "review"),
+                "target": target,
+                "ref": item.get("ref"),
+                "evidence": item.get("evidence"),
+                "agent": item.get("agent", importer.get("name", "import")),
+                "session": None,
+                "mode": "unattended",
+                "import_key": key,
+                "import_hash": item_hash,
+            }
+            record["target_hash"] = fingerprint(config, {**record, "at": now()})
+            config.queue.append({"event": "propose", **record})
+            open_keys.add(key)
+            added += 1
+    return added
+
+
+def cmd_sync(args):
+    print(f"imported {sync(find_config())} new records")
+
+
+def summary(config):
+    records = [r for r in config.queue.records().values() if r["status"] in OPEN]
+    counts = {}
+    for record in records:
+        counts[record["status"]] = counts.get(record["status"], 0) + 1
+    return records, counts
+
+
+def cmd_status(args):
+    config = find_config()
+    records, counts = summary(config)
+    if not records:
+        print("no open memory candidates")
+        return
+    print(", ".join(f"{n} {status}" for status, n in counts.items()))
+
+
+# Hooks
+
+
+def hook_payload():
+    try:
+        return json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return {}
+
+
+def hook_config(payload):
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd")
+    try:
+        return find_config(start)
+    except Error:
+        return None
+
+
+def state_path(config, session):
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "semimem"
+    return base / digest(str(config.root)) / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', session or 'unknown')}.json"
+
+
+def count_tool_calls(transcript):
+    if not transcript or not Path(transcript).is_file():
+        return None
+    text = Path(transcript).read_text(errors="replace")
+    return sum(text.count(marker) for marker in TOOL_CALL_MARKERS)
+
+
+def session_start_context(config, session):
+    me = invocation()
+    try:
+        sync(config)
+    except Exception as error:  # noqa: BLE001 - an importer must never break session start
+        print(f"semimem: sync failed: {error}", file=sys.stderr)
+    records, counts = summary(config)
+    targets = "; ".join(f"{name}: {t.get('description', '')}" for name, t in config.targets.items())
+    lines = [
+        f"Semi-automatic memory is active in this repository ({CONFIG_NAME}). Do not write memory directly:",
+        f"propose candidates with `{me} propose`, and the user approves them. Load the semi-auto-memory skill",
+        "before proposing or reviewing.",
+        f"Mode: {config.mode}. Session id: {session or 'unknown'} (pass --session to propose).",
+        f"Targets: {targets}.",
+    ]
+    if records:
+        pending = counts.get("pending", 0)
+        lines.append(
+            f"Open queue: {', '.join(f'{n} {s}' for s, n in counts.items())}."
+            + (
+                f" When the user is not mid-task, offer once to review the {pending} pending (`{me} render`)."
+                if pending and config.mode == "interactive"
+                else ""
+            )
+        )
+    return "\n".join(lines)
+
+
+def stop_reason(config, session):
+    me = invocation()
+    flag = f" --session {session}" if session else ""
+    if config.mode == "interactive":
+        follow = (
+            f"Then end your reply with the output of `{me} render{flag}` so the user can answer y/n/edit. "
+            "Do not wait for an answer or interrupt your work for it."
+        )
+    else:
+        follow = "This session is unattended: proposing queues them for later review; do not ask anyone."
+    return (
+        "[semi-auto-memory] Before ending, check this session for memory candidates: things a future "
+        "session would waste real time rediscovering, that will stay true for weeks, and that are not "
+        f"already recorded. Propose each with `{me} propose{flag} --title ... --text ... --target ...`. "
+        f"{follow} If there are none, finish normally and do not mention memory."
+    )
+
+
+def cmd_hook(args):
+    payload = hook_payload()
+    if os.environ.get("SEMIMEM_DISABLE"):
+        return
+    config = hook_config(payload)
+    if config is None:
+        return
+    session = payload.get("session_id")
+    if args.event == "session-start":
+        context = session_start_context(config, session)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+        return
+    if payload.get("stop_hook_active"):
+        return
+    path = state_path(config, session)
+    state = json.loads(path.read_text()) if path.exists() else {}
+    calls = count_tool_calls(payload.get("transcript_path"))
+    if calls is None:
+        state["stops"] = state.get("stops", 0) + 1
+        due = state["stops"] - state.get("offered_stops", 0) >= config.min_stops
+        if due:
+            state["offered_stops"] = state["stops"]
+    else:
+        due = calls - state.get("offered_calls", 0) >= config.min_tool_calls
+        if due:
+            state["offered_calls"] = calls
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state))
+    if due:
+        print(json.dumps({"decision": "block", "reason": stop_reason(config, session)}))
+
+
+HOOK_COMMAND = (
+    'r="${{CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}}"; '
+    'p="$r/{path}"; [ -f "$p" ] && exec python3 "$p" hook {event}; exit 0'
+)
+
+
+def cmd_install_hooks(args):
+    config = find_config()
+    path = (
+        Path(args.settings)
+        if args.settings
+        else config.root / {"claude": ".claude/settings.json", "codex": ".codex/hooks.json"}[args.agent]
+    )
+    data = json.loads(path.read_text()) if path.exists() else {}
+    hooks = data.setdefault("hooks", {})
+    for event, name in (("SessionStart", "session-start"), ("Stop", "stop")):
+        groups = hooks.setdefault(event, [])
+        if any(
+            "hook " + name in h.get("command", "") and "semimem" in h.get("command", "")
+            for g in groups
+            for h in g.get("hooks", [])
+        ):
+            continue
+        command = HOOK_COMMAND.format(path=args.script, event=name)
+        groups.append({"hooks": [{"type": "command", "command": command, "timeout": 60}]})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"installed semimem hooks in {path}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="semimem", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    p = commands.add_parser("init", help=f"write a sample {CONFIG_NAME} here")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_init)
+
+    p = commands.add_parser("propose", help="queue a memory candidate")
+    p.add_argument("--title", required=True)
+    p.add_argument("--text", required=True, help="candidate text, or - for stdin")
+    p.add_argument("--kind", choices=KINDS, default="fact")
+    p.add_argument("--target")
+    p.add_argument("--ref", help="where in the target, e.g. a note name or node id")
+    p.add_argument("--evidence", help="why this is true: what happened in the session")
+    p.add_argument("--agent", help="who is proposing (default $SEMIMEM_AGENT)")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_propose)
+
+    p = commands.add_parser("list", help="list records")
+    p.add_argument("--status", default="pending", help="comma-separated statuses, or all")
+    p.add_argument("--session")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = commands.add_parser("show", help="show one record with its history")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_show)
+
+    p = commands.add_parser("render", help="numbered candidate list to show a person")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--status", default="pending")
+    p.add_argument("--session")
+    p.set_defaults(func=cmd_render)
+
+    p = commands.add_parser("approve", help="approve (optionally edited) and write it")
+    p.add_argument("id")
+    p.add_argument("--text", help="replacement text, or - for stdin")
+    p.add_argument("--title")
+    p.add_argument("--target")
+    p.add_argument("--ref")
+    p.add_argument("--by", default=os.environ.get("USER", "user"))
+    p.add_argument("--force", action="store_true", help="write even if the target changed since proposal")
+    p.set_defaults(func=cmd_approve)
+
+    p = commands.add_parser("reject", help="reject a candidate")
+    p.add_argument("id")
+    p.add_argument("--reason")
+    p.add_argument("--by", default=os.environ.get("USER", "user"))
+    p.set_defaults(func=cmd_reject)
+
+    p = commands.add_parser("done", help="mark an agent-written record applied")
+    p.add_argument("id")
+    p.add_argument("--detail")
+    p.set_defaults(func=cmd_done)
+
+    p = commands.add_parser("fail", help="mark an agent-written record failed")
+    p.add_argument("id")
+    p.add_argument("--error", required=True)
+    p.set_defaults(func=cmd_fail)
+
+    p = commands.add_parser("brief", help="self-contained writer instructions for a record")
+    p.add_argument("id")
+    p.set_defaults(func=cmd_brief)
+
+    p = commands.add_parser("targets", help="list configured targets")
+    p.set_defaults(func=cmd_targets)
+
+    p = commands.add_parser("sync", help="run importers")
+    p.set_defaults(func=cmd_sync)
+
+    p = commands.add_parser("status", help="count open records")
+    p.set_defaults(func=cmd_status)
+
+    p = commands.add_parser("hook", help="agent hook entry point (reads hook JSON on stdin)")
+    p.add_argument("event", choices=("session-start", "stop"))
+    p.set_defaults(func=cmd_hook)
+
+    p = commands.add_parser("install-hooks", help="add SessionStart and Stop hooks to an agent's settings")
+    p.add_argument("agent", choices=("claude", "codex"))
+    p.add_argument("--script", required=True, help="path to this script, relative to the repo root")
+    p.add_argument("--settings", help="settings file to edit (default per agent)")
+    p.set_defaults(func=cmd_install_hooks)
+
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except Error as error:
+        print(f"semimem: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
